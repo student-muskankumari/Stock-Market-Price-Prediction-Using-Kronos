@@ -1,0 +1,214 @@
+# src/model_handler_kronos.py
+"""
+Robust Kronos handler with tolerant tokenizer loading.
+If no Kronos tokenizer is found we fallback to a text-based encode/decode
+but do not raise a fatal error — instead log a warning and continue.
+"""
+
+from typing import List, Dict, Any, Optional
+import logging
+import numpy as np
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+class KronosError(RuntimeError):
+    pass
+
+class KronosModelHandler:
+    def __init__(self, model_id: str = "NeoQuasar/Kronos-mini", device: str = "cpu"):
+        self.model_id = model_id
+        self.device = device
+        self.tokenizer = None
+        self.model = None
+        self.tokenizer_available = False
+        self._load()
+
+    def _load(self):
+        """
+        Try to load:
+          - Kronos tokenizer from installed 'kronos' package (preferred)
+          - Kronos tokenizer from Hugging Face tokenizer repo
+          - AutoTokenizer from model repo as fallback
+        If none available, set tokenizer to None but DO NOT raise.
+        Then attempt to load model via transformers AutoModelForCausalLM
+        (trust_remote_code=True to allow custom model code).
+        """
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+            self.AutoTokenizer = AutoTokenizer
+            self.AutoModelForCausalLM = AutoModelForCausalLM
+        except Exception as e:
+            # transformers not installed — we cannot proceed
+            raise KronosError("Please install 'transformers' and 'accelerate' to use Kronos (pip install transformers accelerate).") from e
+
+        # Attempt 1: kronos package (if user installed repo into site-packages)
+        try:
+            # If the cloned repo exposes kronos.tokenizer, this import may succeed
+            from kronos.tokenizer import KronosTokenizer  # type: ignore
+            # If it provides a from_pretrained interface, try to use it
+            try:
+                self.tokenizer = KronosTokenizer.from_pretrained(self.model_id.replace("Kronos-mini","Kronos-Tokenizer-base"))
+            except Exception:
+                # fallback: just keep the tokenizer class available
+                self.tokenizer = KronosTokenizer
+            self.tokenizer_available = True
+            logger.info("Loaded KronosTokenizer from installed kronos package.")
+        except Exception:
+            # Attempt 2: Try to load from a Hugging Face tokenizer repo (common name)
+            try:
+                # try a Kronos tokenizer repo name if present on HF
+                hf_tok_repo = self.model_id.replace("Kronos-mini","Kronos-Tokenizer-base")
+                self.tokenizer = self.AutoTokenizer.from_pretrained(hf_tok_repo, use_fast=False)
+                self.tokenizer_available = True
+                logger.info(f"Loaded tokenizer from HF repo: {hf_tok_repo}")
+            except Exception as e_hf:
+                # Attempt 3: Try to load an AutoTokenizer from the model repo itself (sometimes present)
+                try:
+                    self.tokenizer = self.AutoTokenizer.from_pretrained(self.model_id, use_fast=False)
+                    self.tokenizer_available = True
+                    logger.info(f"Loaded AutoTokenizer fallback from model repo: {self.model_id}")
+                except Exception as e_auto:
+                    # No tokenizer available — log and continue (do NOT raise)
+                    self.tokenizer = None
+                    self.tokenizer_available = False
+                    logger.warning(
+                        "Failed to load any suitable tokenizer for Kronos. "
+                        "Proceeding with fallback text-based encoding/decoding. "
+                        "For accurate numeric decoding install the Kronos tokenizer (from the Kronos GitHub or HF tokenizer repo)."
+                    )
+                    logger.debug("HF tokenizer error: %s", e_hf)
+                    logger.debug("AutoTokenizer error: %s", e_auto)
+
+        # Now load the model (decoder-only LM)
+        try:
+            self.model = self.AutoModelForCausalLM.from_pretrained(self.model_id, trust_remote_code=True)
+            # move model to device if possible
+            try:
+                import torch
+                if self.device == "cuda" and torch.cuda.is_available():
+                    self.model.to("cuda")
+                    logger.info("Model moved to CUDA.")
+            except Exception:
+                logger.info("Torch not available or CUDA not used; using CPU.")
+            logger.info("Loaded Kronos model: %s", self.model_id)
+        except Exception as e:
+            # If the model itself cannot be loaded, raise — there's nothing we can do
+            raise KronosError(f"Failed to load Kronos model {self.model_id}: {e}") from e
+
+    # Encode / decode helpers
+    def encode_klines(self, klines: List[Dict[str, float]]) -> List[int]:
+        """
+        Preferred: use tokenizer.encode_klines if available.
+        Fallback: join numeric values into a tokenizable string and use AutoTokenizer if available.
+        """
+        if self.tokenizer_available and hasattr(self.tokenizer, "encode_klines"):
+            try:
+                return self.tokenizer.encode_klines(klines)
+            except Exception as e:
+                logger.warning("tokenizer.encode_klines failed, falling back to text encoding: %s", e)
+
+        # If we have an AutoTokenizer object instance, use it on a textual representation
+        if self.tokenizer_available and hasattr(self.tokenizer, "encode"):
+            text = "|".join([f"{k['open']},{k['high']},{k['low']},{k['close']},{k.get('volume',0.0)}" for k in klines])
+            return self.tokenizer.encode(text, add_special_tokens=False)
+
+        # Otherwise, produce a simplistic integer sequence by converting floats -> bytes -> ints
+        # This is a very rough fallback and mainly useful for demonstration/prototyping.
+        flat = []
+        for k in klines:
+            flat.extend([k["open"], k["high"], k["low"], k["close"], k.get("volume", 0.0)])
+        # quantize floats into 16-bit integers (unsafe for production)
+        arr = np.array(flat, dtype=np.float32)
+        scaled = (arr * 100).astype(np.int32).tolist()
+        # add a simple separator token id 0 between klines (again, arbitrary)
+        toks = []
+        for i, val in enumerate(scaled):
+            toks.append(int(val & 0x7fffffff))
+        return toks
+
+    def decode_klines(self, token_ids: List[int]) -> List[Dict[str, float]]:
+        """
+        Preferred: use tokenizer.decode_klines if available.
+        Fallback: use tokenizer.decode if available; otherwise attempt to parse numbers from decoded text;
+        as last resort, attempt to remap quantized ints back to floats.
+        """
+        if self.tokenizer_available and hasattr(self.tokenizer, "decode_klines"):
+            try:
+                return self.tokenizer.decode_klines(token_ids)
+            except Exception as e:
+                logger.warning("tokenizer.decode_klines failed, falling back to other decode: %s", e)
+
+        if self.tokenizer_available and hasattr(self.tokenizer, "decode"):
+            txt = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            # try to parse floats
+            parts = [p.strip() for p in txt.replace("|", ",").split(",") if p.strip() != ""]
+            floats = []
+            for p in parts:
+                try:
+                    floats.append(float(p))
+                except:
+                    pass
+            klines = []
+            for i in range(0, len(floats), 5):
+                chunk = floats[i:i+5]
+                if len(chunk) < 4:
+                    break
+                k = {"open": chunk[0], "high": chunk[1], "low": chunk[2], "close": chunk[3], "volume": chunk[4] if len(chunk) > 4 else 0.0}
+                klines.append(k)
+            return klines
+
+        # Last-resort: interpret token_ids as quantized ints and remap back to floats
+        floats = [float(t) / 100.0 for t in token_ids]
+        klines = []
+        for i in range(0, len(floats), 5):
+            chunk = floats[i:i+5]
+            if len(chunk) < 4:
+                break
+            k = {"open": chunk[0], "high": chunk[1], "low": chunk[2], "close": chunk[3], "volume": chunk[4] if len(chunk) > 4 else 0.0}
+            klines.append(k)
+        return klines
+
+    def predict(self, history_klines: List[Dict[str, float]], horizon_klines: int = 10, max_tokens_per_kline: int = 8, temperature: float = 0.0) -> Dict[str, Any]:
+        """
+        Generate future K-lines autoregressively and decode them.
+        Uses the tokenizer if present; otherwise uses fallback encode/decode.
+        """
+        import torch
+        if self.model is None:
+            raise KronosError("Model not loaded")
+
+        # encode history
+        input_ids = self.encode_klines(history_klines)
+        if len(input_ids) == 0:
+            raise KronosError("Input encoding returned empty token list")
+        # Ensure tensor shape [1, seq_len]
+        input_tensor = torch.tensor([input_ids], dtype=torch.long)
+        if self.device == "cuda" and torch.cuda.is_available():
+            input_tensor = input_tensor.to("cuda")
+
+        tokens_per_kline = int(max_tokens_per_kline)
+        max_new_tokens = horizon_klines * tokens_per_kline + 16
+        try:
+            outputs = self.model.generate(
+                input_tensor,
+                max_new_tokens=max_new_tokens,
+                do_sample=False if temperature == 0.0 else True,
+                temperature=float(temperature),
+                pad_token_id=(self.tokenizer.pad_token_id if getattr(self.tokenizer, "pad_token_id", None) is not None else None),
+                eos_token_id=(self.tokenizer.eos_token_id if getattr(self.tokenizer, "eos_token_id", None) is not None else None),
+            )
+        except TypeError:
+            outputs = self.model.generate(
+                input_tensor,
+                max_length=input_tensor.shape[1] + max_new_tokens,
+                do_sample=False if temperature == 0.0 else True,
+                temperature=float(temperature),
+            )
+        gen = outputs[0].cpu().tolist()
+        gen_only = gen[len(input_ids):]
+        pred_klines = self.decode_klines(gen_only)
+        # Trim/pad to requested horizon
+        if len(pred_klines) > horizon_klines:
+            pred_klines = pred_klines[:horizon_klines]
+        return {"klines": pred_klines, "tokens": gen_only}

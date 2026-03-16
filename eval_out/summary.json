@@ -1,0 +1,11 @@
+{
+  "mae": 0.8216686322021486,
+  "rmse": 1.1795132967776514,
+  "mape_pct": 0.38968703043886527,
+  "r2": 0.9977810659317763,
+  "dir_acc": 0.888,
+  "sharpe": 1.0329665481891896,
+  "max_drawdown": 0.0,
+  "csv": "eval_out\\predictions_vs_true.csv",
+  "png": "eval_out\\pred_vs_true.png"
+}

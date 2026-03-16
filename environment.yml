@@ -1,0 +1,15 @@
+name: chronos
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - streamlit
+      - yfinance
+      - pandas
+      - numpy
+      - scikit-learn
+      - joblib
+      - matplotlib
+      - pyyaml
